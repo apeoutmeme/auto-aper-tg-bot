@@ -225,6 +225,12 @@ class SolanaMonitor:
                 self.reconnect_delay = min(300, self.reconnect_delay * 2)
             else:
                 self.reconnect_delay = 5
+            finally:
+                # Ensure tasks are properly cancelled
+                if 'status_task' in locals():
+                    status_task.cancel()
+                if 'pending_tokens_task' in locals():
+                    pending_tokens_task.cancel()
 
     async def _run_websocket(self):
 
@@ -232,6 +238,9 @@ class SolanaMonitor:
 
         async with websockets.connect(RPC_URL) as websocket:
             self.ws = websocket
+            logger.info("WebSocket connection established")
+            
+            # Subscribe to program subscription for token program
             subscribe_message = {
                 "jsonrpc": "2.0",
                 "id": 1,
@@ -246,6 +255,11 @@ class SolanaMonitor:
             await websocket.send(json.dumps(subscribe_message))
             logger.info("Subscription message sent, waiting for messages...")
 
+            # Start periodic tasks in separate tasks
+            status_task = asyncio.create_task(self.send_periodic_status())
+            pending_tokens_task = asyncio.create_task(self.check_pending_tokens())  # New task for checking pending tokens
+            
+            # Main loop to process incoming messages
             while self.should_run:
                 try:
                     logger.debug("Waiting for next message...")
@@ -607,10 +621,11 @@ Wallet: <code>8DbwnZ2eAuxucMzGv5dmDhZBxuzz438rxcHbqBcM1HFB</code>
                         if not has_dexscreener_data:
                             # Store token info for later checking
                             self.pending_tokens[mint_address] = {
+                                'token_info': token_info,
+                                'added_time': time.time(),  # Add current timestamp
+                                'attempts': 0,  # Track how many times we've tried to get DexScreener data
                                 'signature': signature,
                                 'is_pump_fun': is_pump_fun,
-                                'token_info': token_info,
-                                'discovery_time': time.time(),
                                 'check_attempts': 1
                             }
                             logger.info(f"Token {mint_address} added to pending tokens (no DexScreener data yet)")
@@ -788,7 +803,7 @@ Wallet: <code>8DbwnZ2eAuxucMzGv5dmDhZBxuzz438rxcHbqBcM1HFB</code>
                 del self.pending_tokens[mint_address]
             else:
                 # Still no data, check if we should try again
-                time_since_discovery = time.time() - token_data['discovery_time']
+                time_since_discovery = time.time() - token_data['added_time']
                 if time_since_discovery < 3600 and token_data['check_attempts'] < 5:  # Try for up to 1 hour, max 5 attempts
                     # Schedule another check with increasing delay
                     next_delay = delay * 1.5
@@ -1045,6 +1060,39 @@ Celebrity tokens detected: {len(self.owned_tokens)}
                 
             except Exception as e:
                 logger.error(f"Error sending periodic status: {e}")
+
+    async def check_pending_tokens(self):
+        """Periodically check pending tokens for available DexScreener data and remove stale tokens."""
+        try:
+            tokens_to_remove = []
+            current_time = time.time()
+            
+            for mint_address, token_data in self.pending_tokens.items():
+                # Check if the token has been pending for too long (e.g., 30 minutes)
+                if current_time - token_data.get('added_time', current_time) > 1800:
+                    logger.info(f"Removing stale token {mint_address} from pending queue (waited too long for DexScreener data)")
+                    tokens_to_remove.append(mint_address)
+                    continue
+                    
+                # Try to get DexScreener data again
+                dex_data = await self.get_dexscreener_data(mint_address)
+                if dex_data:
+                    logger.info(f"DexScreener data now available for {mint_address}, processing token")
+                    # Remove from pending and process completely
+                    tokens_to_remove.append(mint_address)
+                    # Process with the newly available data
+                    await self.process_token_with_data(mint_address, token_data, dex_data)
+                    
+            # Remove processed or stale tokens from pending list
+            for mint_address in tokens_to_remove:
+                self.pending_tokens.pop(mint_address, None)
+            
+            # Log summary of pending tokens
+            if self.pending_tokens:
+                logger.info(f"Current pending tokens: {len(self.pending_tokens)} tokens waiting for DexScreener data")
+            
+        except Exception as e:
+            logger.error(f"Error checking pending tokens: {e}")
 
 async def main():
     monitor = SolanaMonitor()
