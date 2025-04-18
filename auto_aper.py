@@ -21,7 +21,7 @@ import re
 from datetime import datetime
 from dotenv import load_dotenv
 from unsplash_image_fetcher import UnsplashImageFetcher
-
+import token_trader
 
 
 load_dotenv()
@@ -90,6 +90,34 @@ def setup_logging():
 # Initialize loggers
 logger, analytics_logger, token_count_logger = setup_logging()
 
+# Add a global session for Telegram API
+telegram_session = None
+
+async def create_telegram_session():
+    """Create and return a properly configured aiohttp session for Telegram API"""
+    connector = aiohttp.TCPConnector(
+        limit=20,          # Maximum number of connections
+        limit_per_host=10, # Maximum connections per host
+        enable_cleanup_closed=True,
+        force_close=True,  # Force close connections when done
+        ttl_dns_cache=300  # Cache DNS results for 5 minutes
+    )
+    timeout = aiohttp.ClientTimeout(total=60, connect=10, sock_connect=10, sock_read=30)
+    return aiohttp.ClientSession(connector=connector, timeout=timeout)
+
+# Initialize async resources at startup
+async def init_async_resources():
+    global telegram_session
+    telegram_session = await create_telegram_session()
+    logger.info("Initialized global Telegram API session")
+
+# Cleanup resources at shutdown
+async def cleanup_async_resources():
+    global telegram_session
+    if telegram_session:
+        await telegram_session.close()
+        logger.info("Closed global Telegram API session")
+
 # Solana configuration
 RPC_URL = f"wss://mainnet.helius-rpc.com/?api-key={os.getenv('HELIUS_API_KEY')}"
 TOKEN_PROGRAM_ID = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
@@ -157,6 +185,33 @@ async def get_rugcheck_data(mint_address):
         logger.warning(f"Error fetching RugCheck data: {e}")
         return None
 
+async def send_swap_request(self, token_address, action, amount):
+    """
+    Execute a token swap (buy or sell)
+    
+    Args:
+        token_address: Token address to trade
+        action: 'buy' or 'sell'
+        amount: Amount in SOL
+        
+    Returns:
+        str: Transaction result message
+    """
+    try:
+        # This is a placeholder - implement your actual swap logic here
+        logger.info(f"SIMULATION: {action.upper()} {amount} SOL worth of {token_address}")
+        
+        # For now, return a simulated success message
+        # In a real implementation, this would connect to Jupiter/Raydium/etc.
+        return f"Transaction simulated successfully (DEMO MODE)"
+    except Exception as e:
+        logger.error(f"Error executing {action} swap: {e}")
+        return f"Transaction failed: {str(e)}"
+
+async def get_current_price(self, token_address):
+    """Get current price for a token"""
+    return await token_trader.get_token_price(token_address)
+
 class SolanaMonitor:
     def __init__(self):
         self.ws = None
@@ -173,6 +228,11 @@ class SolanaMonitor:
         # Statistics for token quality assessment
         self.rug_count = 0
         self.good_token_count = 0
+
+        self.token_trader = token_trader.TokenTrader(
+        telegram_sender=self.send_to_telegram,
+        swap_function=self.send_swap_request
+    )
         
         # Add celebrity-related keywords
         self.celebrity_keywords = {
@@ -248,42 +308,96 @@ class SolanaMonitor:
                     pending_tokens_task.cancel()
 
     async def _run_websocket(self):
-
-        logger.info("Attempting to establish WebSocket connection...")
-
-        async with websockets.connect(RPC_URL) as websocket:
-            self.ws = websocket
-            logger.info("WebSocket connection established")
+        try:
+            logger.info("Attempting to establish WebSocket connection...")
             
-            # Subscribe to program subscription for token program
-            subscribe_message = {
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "logsSubscribe",
-                "params": [
-                    {"mentions": [TOKEN_PROGRAM_ID]},
-                    {"commitment": "finalized"}
-                ]
-            }
-            logger.info(f"Sending subscription message: {subscribe_message}")
-
-            await websocket.send(json.dumps(subscribe_message))
-            logger.info("Subscription message sent, waiting for messages...")
-
-            # Start periodic tasks in separate tasks
-            status_task = asyncio.create_task(self.send_periodic_status())
-            pending_tokens_task = asyncio.create_task(self.check_pending_tokens())  # New task for checking pending tokens
+            # Set reasonable timeouts
+            connection_timeout = 30  # 30 seconds to connect
+            ping_interval = 30       # Send ping every 30 seconds
+            ping_timeout = 10        # Wait 10 seconds for pong
             
-            # Main loop to process incoming messages
-            while self.should_run:
-                try:
-                    logger.debug("Waiting for next message...")
-                    message = await websocket.recv()
-                    logger.debug(f"Received raw message: {message[:200]}...")
-                    await self.process_message(message)
-                except websockets.exceptions.ConnectionClosed:
-                    logger.info("WebSocket connection closed")
+            async with websockets.connect(
+                RPC_URL,
+                ping_interval=ping_interval,
+                ping_timeout=ping_timeout,
+                close_timeout=10,
+                max_size=10 * 1024 * 1024,  # 10MB max message size
+                max_queue=1000,             # Maximum queue size
+            ) as websocket:
+                self.ws = websocket
+                logger.info("WebSocket connection established")
+                
+                # Subscribe to program subscription for token program
+                subscribe_message = {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "logsSubscribe",
+                    "params": [
+                        {"mentions": [TOKEN_PROGRAM_ID]},
+                        {"commitment": "finalized"}
+                    ]
+                }
+                logger.info(f"Sending subscription message")
+
+                await websocket.send(json.dumps(subscribe_message))
+                logger.info("Subscription message sent, waiting for messages...")
+
+                # Start periodic tasks in separate tasks
+                status_task = asyncio.create_task(self.send_periodic_status())
+                pending_tokens_task = asyncio.create_task(self.check_pending_tokens())
+                
+                # Schedule regular ping to keep the connection alive
+                ping_task = asyncio.create_task(self._keep_websocket_alive(websocket))
+                
+                # Main loop to process incoming messages
+                while self.should_run:
+                    try:
+                        # Set timeout for receiving messages
+                        message = await asyncio.wait_for(websocket.recv(), timeout=60)
+                        await self.process_message(message)
+                    except asyncio.TimeoutError:
+                        logger.warning("No message received for 60 seconds, checking connection...")
+                        try:
+                            # Check if connection is still alive
+                            pong_waiter = await websocket.ping()
+                            await asyncio.wait_for(pong_waiter, timeout=5)
+                            logger.info("Connection is still alive")
+                        except:
+                            logger.warning("Connection may be dead, will reconnect on next loop")
+                            break
+                    except websockets.exceptions.ConnectionClosed as e:
+                        logger.warning(f"WebSocket connection closed: {e}")
+                        break
+                    
+                # Cancel tasks gracefully
+                for task in [status_task, pending_tokens_task, ping_task]:
+                    if not task.done():
+                        task.cancel()
+                        try:
+                            await task
+                        except asyncio.CancelledError:
+                            pass
+                        
+        except Exception as e:
+            logger.error(f"Error in WebSocket connection: {e}")
+        finally:
+            self.ws = None
+
+    async def _keep_websocket_alive(self, websocket):
+        """Send periodic pings to keep the WebSocket connection alive"""
+        try:
+            while True:
+                await asyncio.sleep(30)  # Ping every 30 seconds
+                if not self.should_run or websocket.closed:
                     break
+                try:
+                    pong_waiter = await websocket.ping()
+                    await asyncio.wait_for(pong_waiter, timeout=5)
+                except:
+                    logger.warning("Failed to receive pong, connection may be dead")
+                    break
+        except asyncio.CancelledError:
+            pass  # Task was cancelled, exit gracefully
 
     def is_token_safe(self, pump_fun_data, rugcheck_data):
         if not pump_fun_data:
@@ -951,10 +1065,11 @@ Wallet: <code>8DbwnZ2eAuxucMzGv5dmDhZBxuzz438rxcHbqBcM1HFB</code>
             await self.send_to_telegram(error_message)
 
     async def send_to_telegram(self, message):
-        """Send a message to the Telegram channel with rate limiting"""
+        """Send a message to the Telegram channel with proper rate limiting and connection handling"""
+        global telegram_session
+        
         try:
             # Rate limiting implementation
-            # Calculate time since last message
             current_time = time.time()
             time_since_last_message = current_time - getattr(self, 'last_telegram_message_time', 0)
             
@@ -970,80 +1085,87 @@ Wallet: <code>8DbwnZ2eAuxucMzGv5dmDhZBxuzz438rxcHbqBcM1HFB</code>
             # Extract image URL if present
             image_url = None
             if "&#8205;" in clean_message:
-                # Find the image URL in the message
                 match = re.search(r'<a href="([^"]+)">&#8205;<\/a>', clean_message)
                 if match:
                     image_url = match.group(1)
-                    # Remove the image link from the message
                     clean_message = clean_message.replace(f'<a href="{image_url}">&#8205;</a>', '')
             
-            # Send the text message first
-            await bot.send_message(
-                chat_id=TELEGRAM_CHANNEL_ID, 
-                text=clean_message, 
-                parse_mode='HTML',
-                disable_web_page_preview=True  # Always disable previews for text
-            )
+            # Ensure we have a session
+            if telegram_session is None or telegram_session.closed:
+                logger.info("Creating new Telegram session as none exists or it was closed")
+                telegram_session = await create_telegram_session()
             
-            # Update last message time
-            self.last_telegram_message_time = time.time()
+            # Send with exponential backoff retry logic
+            max_retries = 5
+            retry_delay = 1
             
-            # If we have an image URL, send it as a separate photo message
-            # But wait 5 seconds first to avoid rate limits
+            for attempt in range(max_retries):
+                try:
+                    # Use the session directly with the Telegram API
+                    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+                    payload = {
+                        "chat_id": TELEGRAM_CHANNEL_ID,
+                        "text": clean_message,
+                        "parse_mode": "HTML",
+                        "disable_web_page_preview": True
+                    }
+                    
+                    async with telegram_session.post(url, json=payload, timeout=30) as response:
+                        if response.status == 200:
+                            response_data = await response.json()
+                            logger.debug(f"Telegram API response: {response_data}")
+                            self.last_telegram_message_time = time.time()
+                            break
+                        elif response.status == 429:
+                            # Handle rate limiting
+                            response_data = await response.json()
+                            retry_after = response_data.get('parameters', {}).get('retry_after', retry_delay * 2)
+                            logger.warning(f"Telegram rate limit hit, waiting {retry_after} seconds")
+                            await asyncio.sleep(retry_after)
+                            continue
+                        else:
+                            logger.error(f"Telegram API error: {response.status}, {await response.text()}")
+                            retry_delay *= 2
+                            await asyncio.sleep(retry_delay)
+                except (aiohttp.ClientConnectionError, asyncio.TimeoutError) as e:
+                    logger.error(f"Connection error on attempt {attempt+1}/{max_retries}: {e}")
+                    retry_delay *= 2
+                    await asyncio.sleep(retry_delay)
+            
+            # Send image if we have one using the same session
             if image_url:
-                logger.info(f"Waiting 5 seconds before sending image")
-                await asyncio.sleep(5)
-                logger.info(f"Sending image: {image_url}")
-                await bot.send_photo(
-                    chat_id=TELEGRAM_CHANNEL_ID,
-                    photo=image_url,
-                    caption=f"Image for token"
-                )
-                # Update the time again after sending the image
-                self.last_telegram_message_time = time.time()
+                await asyncio.sleep(5)  # Wait before sending image to avoid rate limits
+                
+                for attempt in range(max_retries):
+                    try:
+                        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
+                        payload = {
+                            "chat_id": TELEGRAM_CHANNEL_ID,
+                            "photo": image_url,
+                            "caption": "Image for token"
+                        }
+                        
+                        async with telegram_session.post(url, json=payload, timeout=30) as response:
+                            if response.status == 200:
+                                self.last_telegram_message_time = time.time()
+                                break
+                            elif response.status == 429:
+                                # Handle rate limiting
+                                response_data = await response.json()
+                                retry_after = response_data.get('parameters', {}).get('retry_after', retry_delay * 2)
+                                logger.warning(f"Telegram rate limit hit for image, waiting {retry_after} seconds")
+                                await asyncio.sleep(retry_after)
+                            else:
+                                logger.error(f"Telegram API error for image: {response.status}")
+                                retry_delay *= 2
+                                await asyncio.sleep(retry_delay)
+                    except (aiohttp.ClientConnectionError, asyncio.TimeoutError) as e:
+                        logger.error(f"Connection error sending image, attempt {attempt+1}/{max_retries}: {e}")
+                        retry_delay *= 2
+                        await asyncio.sleep(retry_delay)
             
-            logger.info(f"Message sent to Telegram channel")
         except Exception as e:
             logger.error(f"Error sending message to Telegram: {e}")
-            
-            # If we hit a rate limit, extract the retry time and wait accordingly
-            if "429" in str(e) or "too many requests" in str(e).lower() or "flood control" in str(e).lower():
-                retry_seconds = 30  # Default
-                
-                # Try to extract the actual wait time from the error message
-                if "retry in" in str(e).lower():
-                    try:
-                        retry_text = str(e).lower().split("retry in")[1].strip()
-                        seconds = retry_text.split(" ")[0]
-                        retry_seconds = int(seconds) + 5  # Add a buffer
-                    except:
-                        pass
-                    
-                logger.warning(f"Hit Telegram rate limit, waiting {retry_seconds} seconds and retrying...")
-                await asyncio.sleep(retry_seconds)
-                
-                try:
-                    # Retry sending the message
-                    await bot.send_message(
-                        chat_id=TELEGRAM_CHANNEL_ID, 
-                        text=clean_message, 
-                        parse_mode='HTML',
-                        disable_web_page_preview=True
-                    )
-                    self.last_telegram_message_time = time.time()
-                    logger.info(f"Message sent to Telegram channel after retry")
-                    
-                    # If we had an image, try sending that after a delay
-                    if image_url:
-                        await asyncio.sleep(5)
-                        await bot.send_photo(
-                            chat_id=TELEGRAM_CHANNEL_ID,
-                            photo=image_url,
-                            caption=f"Image for token"
-                        )
-                        self.last_telegram_message_time = time.time()
-                except Exception as retry_error:
-                    logger.error(f"Error sending message to Telegram after retry: {retry_error}")
 
     async def send_daily_summary(self):
         """Send a daily summary to the Telegram channel"""
@@ -1161,8 +1283,60 @@ Celebrity tokens detected: {len(self.owned_tokens)}
             return None
 
 async def main():
-    monitor = SolanaMonitor()
-    await monitor.start_monitoring()
+    # Initialize resources
+    await init_async_resources()
+    
+    try:
+        # Start the monitor
+        monitor = SolanaMonitor()
+        monitor_task = asyncio.create_task(monitor.start_monitoring())
+        
+        # Start a minimal HTTP server for health checks on Render
+        from aiohttp import web
+        
+        # Simple HTTP routes
+        routes = web.RouteTableDef()
+        
+        @routes.get('/')
+        async def health_check(request):
+            return web.Response(text="SolSentinel is running")
+        
+        @routes.get('/status')
+        async def status(request):
+            return web.json_response({
+                "status": "running",
+                "tokens_processed": monitor.processed_tokens_count,
+                "tokens_with_data": monitor.tokens_with_dexscreener_data,
+                "pending_tokens": len(monitor.pending_tokens),
+                "uptime": time.time() - getattr(monitor, 'start_time', time.time())
+            })
+        
+        # Create app
+        app = web.Application()
+        app.add_routes(routes)
+        
+        # Get port from environment or use default
+        port = int(os.environ.get('PORT', 8080))
+        logger.info(f"Starting HTTP server on port {port}")
+        
+        # Start the server
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, '0.0.0.0', port)
+        server_task = asyncio.create_task(site.start())
+        
+        # Wait for tasks
+        await asyncio.gather(monitor_task, server_task)
+        
+    except Exception as e:
+        logger.error(f"Error in main: {e}")
+    finally:
+        # Clean up resources
+        await cleanup_async_resources()
 
 if __name__ == "__main__":
+    # Set start time
+    start_time = time.time()
+    
+    # Run main
     asyncio.run(main())
