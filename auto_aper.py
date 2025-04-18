@@ -20,6 +20,7 @@ from telegram.ext import filters
 import re
 from datetime import datetime
 from dotenv import load_dotenv
+from unsplash_image_fetcher import UnsplashImageFetcher
 
 
 
@@ -108,6 +109,9 @@ TELEGRAM_CHANNEL_ID = os.getenv('TELEGRAM_CHANNEL_ID')
 # Initialize Telegram bot
 bot = telegram.Bot(token=TELEGRAM_BOT_TOKEN)
 
+# Initialize during your setup
+image_fetcher = UnsplashImageFetcher()
+
 async def get_dexscreener_data(mint_address):
     url = f"https://api.dexscreener.com/latest/dex/tokens/{mint_address}"
     async with aiohttp.ClientSession() as session:
@@ -131,16 +135,27 @@ async def get_pump_fun_data(mint_address: str):
     logger.warning(f"No Pump.fun data found for {mint_address}")
     return None
 
-async def get_rugcheck_data(mint_address: str):
-    url = f"https://api.rugcheck.xyz/v1/tokens/{mint_address}/report/summary"
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url) as response:
-            if response.status == 200:
-                data = await response.json()
-                logger.info(f"RugCheck API response for {mint_address}: {data}")
-                return data
-    logger.warning(f"No RugCheck data found for {mint_address}")
-    return None
+async def get_rugcheck_data(mint_address):
+    """Get rugcheck data for a token, with improved error handling"""
+    try:
+        url = f"https://api.rugcheck.xyz/v1/tokens/{mint_address}/score"
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=5) as response:  # Reduce timeout
+                if response.status == 200:
+                    data = await response.json()
+                    return data
+                else:
+                    logger.warning(f"RugCheck API returned status {response.status} for {mint_address}")
+                    return None
+    except aiohttp.ClientConnectorError:
+        logger.warning(f"Cannot connect to RugCheck API (service may be down)")
+        return None
+    except asyncio.TimeoutError:
+        logger.warning(f"RugCheck API timeout for {mint_address}")
+        return None
+    except Exception as e:
+        logger.warning(f"Error fetching RugCheck data: {e}")
+        return None
 
 class SolanaMonitor:
     def __init__(self):
@@ -375,6 +390,28 @@ class SolanaMonitor:
         else:
             message += f"\n{Fore.RED}⚠️ No RugCheck data available for this token.{Style.RESET_ALL}"
 
+        # Get token name and symbol from dexscreener data
+        token_name = dexscreener_data.get('baseToken', {}).get('name', 'Unknown')
+        token_symbol = dexscreener_data.get('baseToken', {}).get('symbol', 'Unknown')
+
+        # Get a related image
+        image_data = None
+        try:
+            # Try token name first
+            image_data = image_fetcher.get_related_image(token_name, token_symbol)
+            
+            # If no image found and token name is very specific, try more generic search
+            if not image_data or 'url' not in image_data:
+                logger.info(f"No specific image found for {token_name}, trying generic cryptocurrency image")
+                image_data = image_fetcher.get_related_image("cryptocurrency", "token")
+            
+            # Add image URL to your Telegram message if available
+            if image_data and 'url' in image_data:
+                logger.info(f"Adding image URL to message: {image_data['url']}")
+                message += f"\n\n<a href=\"{image_data['url']}\">&#8205;</a>"  # This creates an invisible link that generates a preview
+        except Exception as img_error:
+            logger.warning(f"Error fetching image: {img_error}")
+
         return message
 
     def format_pump_fun_message(self, signature, mint_address, pump_fun_data):
@@ -584,14 +621,38 @@ Wallet: <code>8DbwnZ2eAuxucMzGv5dmDhZBxuzz438rxcHbqBcM1HFB</code>
                     
                     # Fetch token info with error handling
                     try:
-                        token_info = await get_token_info(mint_address)
+                        # Remove await here as get_token_info returns a dict, not a coroutine
+                        token_info = get_token_info(mint_address)
                         logger.info(f"Token info received: {token_info}")
+                        
+                        # Get token name and symbol from token_info if available
+                        token_name = "Unknown"
+                        token_symbol = "Unknown"
+                        if token_info and 'mintAuthority' in token_info:
+                            token_name = token_info.get('name', 'Unknown')
+                            token_symbol = token_info.get('symbol', 'Unknown')
+                        
+                        # Always send a basic Telegram message for each new token detected
+                        basic_message = f"""<b>🔍 SolSentinel #{self.processed_tokens_count}</b>
+
+<b>New Token Detected</b>
+
+<b>Token Details:</b>
+• Mint: <code>{mint_address}</code>
+• Platform: {("pump.fun" if is_pump_fun else "Solana")}
+
+<b>Links:</b>
+• <a href="https://explorer.solana.com/tx/{signature}">Transaction</a>
+• <a href="https://solscan.io/token/{mint_address}">Token Info</a>
+"""
+                        # Send the basic notification immediately
+                        await self.send_to_telegram(basic_message)
                         
                         # Use DexScreener data instead of token metadata
                         dexscreener_response = await get_dexscreener_data(mint_address)
                         logger.info(f"DexScreener API response: {dexscreener_response}")
                         
-                        # Check if we have valid DexScreener data - THE CRITICAL FIX
+                        # Check if we have valid DexScreener data
                         has_dexscreener_data = False
                         dexscreener_data = None
                         
@@ -608,80 +669,65 @@ Wallet: <code>8DbwnZ2eAuxucMzGv5dmDhZBxuzz438rxcHbqBcM1HFB</code>
                         logger.info(f"DexScreener data processed: {dexscreener_data}")
                         logger.info(f"Has DexScreener data: {has_dexscreener_data}")
                         
-                        # Get rugcheck data
-                        rugcheck_data = await get_rugcheck_data(mint_address)
+                        # Get rugcheck data (optional now)
+                        rugcheck_data = None
+                        try:
+                            rugcheck_data = await get_rugcheck_data(mint_address)
+                            # Update rug vs good token counts based on rugcheck data
+                            if rugcheck_data:
+                                if rugcheck_data.get('score', 1000) > 500:
+                                    self.rug_count += 1
+                                else:
+                                    self.good_token_count += 1
+                        except Exception as e:
+                            logger.warning(f"Error with RugCheck API (continuing without security data): {e}")
                         
-                        # Update rug vs good token counts based on rugcheck data
-                        if rugcheck_data:
-                            if rugcheck_data.get('score', 1000) > 500:
-                                self.rug_count += 1
-                            else:
-                                self.good_token_count += 1
-                        
-                        if not has_dexscreener_data:
-                            # Store token info for later checking
-                            self.pending_tokens[mint_address] = {
-                                'token_info': token_info,
-                                'added_time': time.time(),  # Add current timestamp
-                                'attempts': 0,  # Track how many times we've tried to get DexScreener data
+                        # If DexScreener data is available, send a more detailed follow-up message
+                        if has_dexscreener_data:
+                            self.tokens_with_dexscreener_data += 1
+                            await self.process_token_with_data(mint_address, {
                                 'signature': signature,
                                 'is_pump_fun': is_pump_fun,
-                                'check_attempts': 1
-                            }
-                            logger.info(f"Token {mint_address} added to pending tokens (no DexScreener data yet)")
-                            
-                            # Schedule a check for this token later
-                            asyncio.create_task(self.check_pending_token_later(mint_address))
-                            
-                            # Don't continue processing until we have DexScreener data
-                            logger.info(f"Skipping detailed processing for {mint_address} until DexScreener data is available")
-                            return
+                                'token_info': token_info,
+                                'added_time': time.time(),
+                                'social_links': {
+                                    'twitter': '',
+                                    'telegram': ''
+                                }
+                            }, dexscreener_data)
                         else:
-                            # We have DexScreener data, increment counter
-                            self.tokens_with_dexscreener_data += 1
-                            logger.info(f"Token {mint_address} has DexScreener data (Total with data: {self.tokens_with_dexscreener_data})")
-                            
+                            # Store in pending tokens for later processing when DexScreener data becomes available
+                            self.pending_tokens[mint_address] = {
+                                'signature': signature,
+                                'is_pump_fun': is_pump_fun,
+                                'token_info': token_info,
+                                'added_time': time.time(),
+                                'social_links': {
+                                    'twitter': '',
+                                    'telegram': ''
+                                }
+                            }
+                    
                     except Exception as e:
                         logger.error(f"Error fetching token data: {e}")
-                        return
+                        
+                        # Even if there's an error, send a basic Telegram message
+                        basic_error_message = f"""<b>🔍 SolSentinel #{self.processed_tokens_count}</b>
 
-                    # Now process the token with DexScreener data
-                    # ... rest of your existing processing code ...
-                    
-                    # Format and send the Telegram message
-                    telegram_message = self.format_token_message(signature, mint_address, token_info, dexscreener_data, rugcheck_data, is_pump_fun)
-                    await self.send_to_telegram(telegram_message)
-                    
-                    # Check if token is safe and make a buy
-                    if dexscreener_data and rugcheck_data:
-                        is_safe = True
-                        if is_safe:
-                            logger.info(f"Token {mint_address} appears safe, initiating buy transaction")
-                            buy_amount = 0.003  # Default amount in SOL
-                            buy_result = await self.send_swap_request(mint_address, action="buy", amount=buy_amount)
-                            buy_message = f"""<b>🔄 Buy Transaction</b>
-                            
-Token: <b>{dexscreener_data.get('baseToken', {}).get('name', 'Unknown')}</b>
-Mint: <code>{mint_address}</code>
-Amount: {buy_amount} SOL
-Result: {buy_result}
-Wallet: <code>8DbwnZ2eAuxucMzGv5dmDhZBxuzz438rxcHbqBcM1HFB</code>
+<b>New Token Detected (Error in processing details)</b>
 
-<i>Starting ROI monitoring</i>
+<b>Token Details:</b>
+• Mint: <code>{mint_address}</code>
+• Platform: {("pump.fun" if is_pump_fun else "Solana")}
+
+<b>Links:</b>
+• <a href="https://explorer.solana.com/tx/{signature}">Transaction</a>
+• <a href="https://solscan.io/token/{mint_address}">Token Info</a>
 """
-                            await self.send_to_telegram(buy_message)
-                            
-                            # Start monitoring ROI
-                            asyncio.create_task(self.monitor_roi(mint_address, buy_amount))
-                        else:
-                            logger.info(f"Token {mint_address} did not pass safety checks, no buy initiated")
-                    
-                else:
-                    logger.debug(f"Duplicate or invalid mint address for transaction {signature}")
-            else:
-                logger.debug(f"No transaction details found for {signature}")
+                        await self.send_to_telegram(basic_error_message)
+        
         except Exception as e:
-            logger.error(f"Error processing transaction {signature}: {e}", exc_info=True)
+            logger.error(f"Error processing transaction {signature}: {e}")
 
     def format_token_message(self, signature, mint_address, token_info, dexscreener_data, rugcheck_data, is_pump_fun):
         """Format a comprehensive message for a token with DexScreener data"""
@@ -773,7 +819,6 @@ Wallet: <code>8DbwnZ2eAuxucMzGv5dmDhZBxuzz438rxcHbqBcM1HFB</code>
 """
 
         return message
-
     async def check_pending_token_later(self, mint_address, delay=300):
         """Check a pending token for DexScreener data after a delay"""
         await asyncio.sleep(delay)  # Wait 5 minutes by default
@@ -820,177 +865,185 @@ Wallet: <code>8DbwnZ2eAuxucMzGv5dmDhZBxuzz438rxcHbqBcM1HFB</code>
         """Process a token that now has DexScreener data"""
         try:
             signature = token_data['signature']
-            is_pump_fun = token_data['is_pump_fun']
-            token_info = token_data['token_info']
+            is_pump_fun = token_data.get('is_pump_fun', False)
+            token_info = token_data.get('token_info', {})
             
-            # Get rugcheck data
-            rugcheck_data = await get_rugcheck_data(mint_address)
+            # Log that we're processing with DexScreener data
+            logger.info(f"Processing token {mint_address} with DexScreener data")
             
-            # Get pump.fun data if applicable
-            pump_fun_data = None
-            if is_pump_fun:
-                pump_fun_data = await get_pump_fun_data(mint_address)
+            # Get token name and symbol from DexScreener data
+            token_name = dexscreener_data.get('baseToken', {}).get('name', 'Unknown')
+            token_symbol = dexscreener_data.get('baseToken', {}).get('symbol', 'Unknown')
             
-            # Prepare token data for celebrity detection
-            token_data_for_detection = {
-                'name': '',
-                'symbol': '',
-                'description': '',
-                'social_links': {
-                    'twitter': '',
-                    'telegram': '',
-                }
-            }
+            # Get price info
+            price_usd = dexscreener_data.get('priceUsd', 'Unknown')
+            price_native = dexscreener_data.get('priceNative', 'Unknown')
             
-            # Extract data from DexScreener
-            pair = dexscreener_data['pairs'][0]
-            base_token = pair.get('baseToken', {})
-            token_data_for_detection['name'] = base_token.get('name', '')
-            token_data_for_detection['symbol'] = base_token.get('symbol', '')
+            # Calculate marketcap
+            marketcap = dexscreener_data.get('fdv', 'Unknown')
+            if marketcap == 'Unknown' and price_usd != 'Unknown' and token_info.get('supply'):
+                supply = float(token_info.get('supply', 0))
+                decimals = int(token_info.get('decimals', 0))
+                adjusted_supply = supply / (10 ** decimals)
+                marketcap = adjusted_supply * float(price_usd)
             
-            # Add pump.fun data if available
-            if pump_fun_data:
-                token_data_for_detection['name'] = pump_fun_data.get('name', token_data_for_detection['name'])
-                token_data_for_detection['symbol'] = pump_fun_data.get('symbol', token_data_for_detection['symbol'])
-                token_data_for_detection['description'] = pump_fun_data.get('description', '')
-                token_data_for_detection['social_links']['twitter'] = pump_fun_data.get('twitter', '')
-                token_data_for_detection['social_links']['telegram'] = pump_fun_data.get('telegram', '')
-            
-            # Check if it's a celebrity token
-            is_celebrity, celebrity_info = self.is_potential_celebrity_token(token_data_for_detection)
-            
-            # Format and send Telegram message with all DexScreener data
-            token_type = "🌟 Celebrity Token" if is_celebrity else "🪙 Standard Token"
-            platform = "Pump.fun" if is_pump_fun else "Solana"
-            
-            # Format token name and symbol
-            token_name = token_data_for_detection['name'] if token_data_for_detection['name'] else "Unknown"
-            token_symbol = token_data_for_detection['symbol'] if token_data_for_detection['symbol'] else "Unknown"
-            
-            # Get all DexScreener data
-            pair = dexscreener_data['pairs'][0]
-            price_usd = f"${pair.get('priceUsd', 'Unknown')}"
-            price_native = f"{pair.get('priceNative', 'Unknown')} SOL"
-            market_cap = f"${pair.get('marketCap', 'Unknown')}"
-            fdv = f"${pair.get('fdv', 'Unknown')}"
-            
-            # Get transaction data
-            txns = pair.get('txns', {})
-            txns_24h = txns.get('h24', {})
-            buys_24h = txns_24h.get('buys', 0)
-            sells_24h = txns_24h.get('sells', 0)
-            
-            # Get volume data
-            volume = pair.get('volume', {})
-            volume_24h = f"${volume.get('h24', 'Unknown')}"
-            
-            # Get price change data
-            price_change = pair.get('priceChange', {})
-            price_change_24h = f"{price_change.get('h24', 'Unknown')}%"
-            
-            # Get pair creation time
-            pair_created_at = pair.get('pairCreatedAt', 0)
-            if pair_created_at:
-                created_time = datetime.fromtimestamp(pair_created_at / 1000).strftime('%Y-%m-%d %H:%M:%S')
-            else:
-                created_time = "Unknown"
-            
-            # Get DEX info
-            dex_id = pair.get('dexId', 'Unknown')
-            pair_address = pair.get('pairAddress', 'Unknown')
-            dex_url = pair.get('url', f"https://dexscreener.com/solana/{pair_address}")
-            
-            # Format the message with all DexScreener data
-            telegram_message = f"""<b>🔍 SolSentinel #{self.processed_tokens_count}</b>
+            # Format the detailed message
+            detailed_message = f"""<b>🚀 {token_name} ({token_symbol})</b>
 
-<b>{token_type} Detected on {platform}</b>
-<i>DexScreener data now available</i>
+💰 <b>Market:</b>
+• Price: ${price_usd} ({price_native} SOL)
+• Market Cap: ${format(marketcap, ',.2f') if isinstance(marketcap, (int, float)) else 'Unknown'}
+• Volume (24h): ${format(dexscreener_data.get('volume', {}).get('h24', 0), ',.2f') if isinstance(dexscreener_data.get('volume', {}).get('h24'), (int, float)) else 'Unknown'}
+• Liquidity: ${format(dexscreener_data.get('liquidity', {}).get('usd', 0), ',.2f') if isinstance(dexscreener_data.get('liquidity', {}).get('usd'), (int, float)) else 'Unknown'}
 
-<b>Token Details:</b>
-• Name: <b>{token_name}</b>
-• Symbol: <b>{token_symbol}</b>
-• Mint: <code>{mint_address}</code>
+📊 <b>Activity:</b>
+• 24h Change: {dexscreener_data.get('priceChange', {}).get('h24', 'Unknown')}%
+• Platform: {("pump.fun" if is_pump_fun else "Solana")}
+• Age: {((time.time() - (dexscreener_data.get('pairCreatedAt', time.time()*1000)/1000)) / 3600):.1f}h
 
-<b>Price Information:</b>
-• Price USD: {price_usd}
-• Price SOL: {price_native}
-• 24h Change: {price_change_24h}
-• Market Cap: {market_cap}
-• Fully Diluted Value: {fdv}
-
-<b>Trading Activity:</b>
-• 24h Volume: {volume_24h}
-• 24h Buys: {buys_24h}
-• 24h Sells: {sells_24h}
-• Created: {created_time}
-
-<b>DEX Information:</b>
-• DEX: {dex_id}
-• Pair: <code>{pair_address}</code>
-
-<b>Links:</b>
-• <a href="{dex_url}">DexScreener</a>
+🔗 <b>Links:</b>
+• <a href="{dexscreener_data.get('url', f'https://dexscreener.com/solana/{mint_address}')}">DexScreener</a>
 • <a href="https://explorer.solana.com/tx/{signature}">Transaction</a>
 • <a href="https://solscan.io/token/{mint_address}">Token Info</a>
-• <a href="https://solscan.io/account/8DbwnZ2eAuxucMzGv5dmDhZBxuzz438rxcHbqBcM1HFB">Wallet</a>
-"""
+• <a href="https://birdeye.so/token/{mint_address}?chain=solana">Birdeye</a>
+• <a href="https://dexlab.space/market/{mint_address}">Dexlab</a>
+{f'• <a href="{dexscreener_data.get("info", {}).get("socials", [{}])[0].get("url", "")}">Twitter</a>' if dexscreener_data.get("info", {}).get("socials") and dexscreener_data.get("info", {}).get("socials")[0].get("type") == "twitter" else ''}
+{f'• <a href="{dexscreener_data.get("info", {}).get("websites", [{}])[0].get("url", "")}">Website</a>' if dexscreener_data.get("info", {}).get("websites") else ''}
 
-            # Add celebrity info if applicable
-            if is_celebrity:
-                telegram_message += f"""
-<b>Celebrity Detection:</b>
-• Confidence: {celebrity_info['confidence_score']}%
-• Matches: {', '.join(celebrity_info['celebrity_matches']) if celebrity_info['celebrity_matches'] else 'None'}
-• Related Terms: {', '.join(celebrity_info['related_term_matches']) if celebrity_info['related_term_matches'] else 'None'}
-"""
+<code>{mint_address}</code>
 
-            # Add rugcheck info if available
-            if rugcheck_data:
-                risk_level = "Low" if rugcheck_data.get('score', 1000) < 500 else "High"
-                telegram_message += f"""
-<b>Security Analysis:</b>
-• Risk Level: {risk_level}
-• RugCheck Score: {rugcheck_data.get('score', 'N/A')}
-"""
-
-            # Add social links if available
-            social_links = []
-            if token_data_for_detection['social_links']['twitter']:
-                social_links.append(f"• <a href='{token_data_for_detection['social_links']['twitter']}'>Twitter</a>")
-            if token_data_for_detection['social_links']['telegram']:
-                social_links.append(f"• <a href='{token_data_for_detection['social_links']['telegram']}'>Telegram</a>")
+<i>SolSentinel #{self.processed_tokens_count}</i>"""
             
-            if social_links:
-                telegram_message += f"""
-<b>Social Links:</b>
-{''.join(social_links)}
-"""
-
-            # Send the message to Telegram
-            await self.send_to_telegram(telegram_message)
-            
-            # Process as celebrity token if applicable
-            if is_celebrity:
-                logger.info(f"{Fore.MAGENTA}🌟 Celebrity Token with DexScreener data detected! Processing details...{Style.RESET_ALL}")
-                # ... existing celebrity token processing code ...
+            # Get a related image
+            image_data = None
+            try:
+                # Try token name first
+                image_data = image_fetcher.get_related_image(token_name, token_symbol)
                 
+                # If no image found and token name is very specific, try more generic search
+                if not image_data or 'url' not in image_data:
+                    logger.info(f"No specific image found for {token_name}, trying generic cryptocurrency image")
+                    image_data = image_fetcher.get_related_image("cryptocurrency", "token")
+                
+                # Add image URL to your Telegram message if available
+                if image_data and 'url' in image_data:
+                    logger.info(f"Adding image URL to message: {image_data['url']}")
+                    detailed_message += f"\n\n<a href=\"{image_data['url']}\">&#8205;</a>"  # This creates an invisible link that generates a preview
+            except Exception as img_error:
+                logger.warning(f"Error fetching image: {img_error}")
+            
+            # Send the detailed message
+            logger.info(f"Sending detailed message for token {mint_address}")
+            await self.send_to_telegram(detailed_message)
+            
+            # Add to processed tokens with data
+            self.tokens_with_dexscreener_data += 1
+            
         except Exception as e:
-            logger.error(f"Error processing token with data {mint_address}: {e}")
+            logger.error(f"Error processing token with DexScreener data {mint_address}: {e}")
+            # Try to send a simplified message if detailed processing fails
+            error_message = f"""<b>⚠️ Token with DexScreener Data (Error in processing)</b>
+
+<b>Token Details:</b>
+• Mint: <code>{mint_address}</code>
+• DexScreener: <a href="https://dexscreener.com/solana/{mint_address}">View</a>
+"""
+            await self.send_to_telegram(error_message)
 
     async def send_to_telegram(self, message):
-        """Send a message to the Telegram channel"""
+        """Send a message to the Telegram channel with rate limiting"""
         try:
+            # Rate limiting implementation
+            # Calculate time since last message
+            current_time = time.time()
+            time_since_last_message = current_time - getattr(self, 'last_telegram_message_time', 0)
+            
+            # If less than 30 seconds since last message, wait
+            if time_since_last_message < 30:
+                wait_time = 30 - time_since_last_message
+                logger.info(f"Rate limiting: Waiting {wait_time:.1f} seconds before sending next message")
+                await asyncio.sleep(wait_time)
+            
             # Strip ANSI color codes for Telegram
             clean_message = re.sub(r'\x1b\[\d+m', '', message)
+            
+            # Extract image URL if present
+            image_url = None
+            if "&#8205;" in clean_message:
+                # Find the image URL in the message
+                match = re.search(r'<a href="([^"]+)">&#8205;<\/a>', clean_message)
+                if match:
+                    image_url = match.group(1)
+                    # Remove the image link from the message
+                    clean_message = clean_message.replace(f'<a href="{image_url}">&#8205;</a>', '')
+            
+            # Send the text message first
             await bot.send_message(
                 chat_id=TELEGRAM_CHANNEL_ID, 
                 text=clean_message, 
                 parse_mode='HTML',
-                disable_web_page_preview=True  # Prevent link previews to keep messages compact
+                disable_web_page_preview=True  # Always disable previews for text
             )
+            
+            # Update last message time
+            self.last_telegram_message_time = time.time()
+            
+            # If we have an image URL, send it as a separate photo message
+            # But wait 5 seconds first to avoid rate limits
+            if image_url:
+                logger.info(f"Waiting 5 seconds before sending image")
+                await asyncio.sleep(5)
+                logger.info(f"Sending image: {image_url}")
+                await bot.send_photo(
+                    chat_id=TELEGRAM_CHANNEL_ID,
+                    photo=image_url,
+                    caption=f"Image for token"
+                )
+                # Update the time again after sending the image
+                self.last_telegram_message_time = time.time()
+            
             logger.info(f"Message sent to Telegram channel")
         except Exception as e:
             logger.error(f"Error sending message to Telegram: {e}")
+            
+            # If we hit a rate limit, extract the retry time and wait accordingly
+            if "429" in str(e) or "too many requests" in str(e).lower() or "flood control" in str(e).lower():
+                retry_seconds = 30  # Default
+                
+                # Try to extract the actual wait time from the error message
+                if "retry in" in str(e).lower():
+                    try:
+                        retry_text = str(e).lower().split("retry in")[1].strip()
+                        seconds = retry_text.split(" ")[0]
+                        retry_seconds = int(seconds) + 5  # Add a buffer
+                    except:
+                        pass
+                    
+                logger.warning(f"Hit Telegram rate limit, waiting {retry_seconds} seconds and retrying...")
+                await asyncio.sleep(retry_seconds)
+                
+                try:
+                    # Retry sending the message
+                    await bot.send_message(
+                        chat_id=TELEGRAM_CHANNEL_ID, 
+                        text=clean_message, 
+                        parse_mode='HTML',
+                        disable_web_page_preview=True
+                    )
+                    self.last_telegram_message_time = time.time()
+                    logger.info(f"Message sent to Telegram channel after retry")
+                    
+                    # If we had an image, try sending that after a delay
+                    if image_url:
+                        await asyncio.sleep(5)
+                        await bot.send_photo(
+                            chat_id=TELEGRAM_CHANNEL_ID,
+                            photo=image_url,
+                            caption=f"Image for token"
+                        )
+                        self.last_telegram_message_time = time.time()
+                except Exception as retry_error:
+                    logger.error(f"Error sending message to Telegram after retry: {retry_error}")
 
     async def send_daily_summary(self):
         """Send a daily summary to the Telegram channel"""
@@ -1075,7 +1128,7 @@ Celebrity tokens detected: {len(self.owned_tokens)}
                     continue
                     
                 # Try to get DexScreener data again
-                dex_data = await self.get_dexscreener_data(mint_address)
+                dex_data = await get_dexscreener_data(mint_address)
                 if dex_data:
                     logger.info(f"DexScreener data now available for {mint_address}, processing token")
                     # Remove from pending and process completely
@@ -1093,6 +1146,19 @@ Celebrity tokens detected: {len(self.owned_tokens)}
             
         except Exception as e:
             logger.error(f"Error checking pending tokens: {e}")
+
+    async def get_current_price(self, mint_address):
+        """Get the current price of a token from DexScreener"""
+        try:
+            dexscreener_data = await get_dexscreener_data(mint_address)
+            if dexscreener_data and 'pairs' in dexscreener_data and dexscreener_data['pairs']:
+                pair = dexscreener_data['pairs'][0]
+                price_usd = float(pair.get('priceUsd', 0))
+                return price_usd
+            return None
+        except Exception as e:
+            logger.error(f"Error getting current price for {mint_address}: {e}")
+            return None
 
 async def main():
     monitor = SolanaMonitor()
