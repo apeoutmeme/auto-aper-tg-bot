@@ -93,6 +93,9 @@ logger, analytics_logger, token_count_logger = setup_logging()
 # Add a global session for Telegram API
 telegram_session = None
 
+# Add this near the top of your file where you load other env variables
+TELEGRAM_TOPIC_ID = os.getenv('TELEGRAM_TOPIC_ID')
+
 async def create_telegram_session():
     """Create and return a properly configured aiohttp session for Telegram API"""
     connector = aiohttp.TCPConnector(
@@ -133,7 +136,6 @@ logged_mint_addresses = set()
 # Telegram configuration
 TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 TELEGRAM_CHANNEL_ID = os.getenv('TELEGRAM_CHANNEL_ID')
-
 # Initialize Telegram bot
 bot = telegram.Bot(token=TELEGRAM_BOT_TOKEN)
 
@@ -185,29 +187,6 @@ async def get_rugcheck_data(mint_address):
         logger.warning(f"Error fetching RugCheck data: {e}")
         return None
 
-async def send_swap_request(self, token_address, action, amount):
-    """
-    Execute a token swap (buy or sell)
-    
-    Args:
-        token_address: Token address to trade
-        action: 'buy' or 'sell'
-        amount: Amount in SOL
-        
-    Returns:
-        str: Transaction result message
-    """
-    try:
-        # This is a placeholder - implement your actual swap logic here
-        logger.info(f"SIMULATION: {action.upper()} {amount} SOL worth of {token_address}")
-        
-        # For now, return a simulated success message
-        # In a real implementation, this would connect to Jupiter/Raydium/etc.
-        return f"Transaction simulated successfully (DEMO MODE)"
-    except Exception as e:
-        logger.error(f"Error executing {action} swap: {e}")
-        return f"Transaction failed: {str(e)}"
-
 async def get_current_price(self, token_address):
     """Get current price for a token"""
     return await token_trader.get_token_price(token_address)
@@ -232,7 +211,16 @@ class SolanaMonitor:
         self.token_trader = token_trader.TokenTrader(
         telegram_sender=self.send_to_telegram,
         swap_function=self.send_swap_request
-    )
+        
+        )
+        self.auto_trading_enabled = True  # Set to False to disable auto-buying
+        self.trading_budget_per_day = 0.05  # Maximum SOL to spend per day
+        self.spent_today = 0  # Track daily spending
+        self.last_spending_reset = time.time()  # For daily budget reset
+        self.minimum_buy_score = 50  # Minimum score to trigger a buy (0-100)
+        self.max_investment_per_token = 0.01  # Maximum SOL per token
+        self.min_investment_per_token = 0.001  # Minimum SOL per token
+        self.bought_tokens = set()  # Track tokens we've bought
         
         # Add celebrity-related keywords
         self.celebrity_keywords = {
@@ -593,7 +581,7 @@ class SolanaMonitor:
         except Exception as e:
             logger.error(f"Error processing message: {str(e)}", exc_info=True)
 
-    async def send_swap_request(self, mint_address, action="buy", amount=0.003):
+    async def send_swap_request(self, mint_address, action="buy", amount=0.0001):
         url = "https://pumpportal.fun/api/trade?api-key=6th2pdup75166u36dwup6tjbdgtnagk4f9mk4rjfb5c5gvkd8d4njmvee143ctueanjm8vv3e93m6n35712mgh2fd10per9hb176wmhhawtmmkbha8u7jnkpb5x54nb3ddrq8maqcwykudhpqan26a5t38k3h5d76yvude8952pwn31at74uuu3cnqq8ma66tmpphjuen0kuf8"
         payload = {
             "action": action,
@@ -609,7 +597,8 @@ class SolanaMonitor:
             response = requests.post(url, json=payload)
             response.raise_for_status()
             logger.info(f"Swap response: {response.json()}")
-            return "Swap successful" if "Swap successful" in response.json() else "Swap failed"
+            response_data = response.json()
+            return f"{'Swap successful' if 'signature' in response_data else 'Swap failed'}: {response_data}"
         except requests.exceptions.RequestException as e:
             logger.error(f"Error during swap request: {e}")
             return f"Swap failed: {str(e)}"
@@ -1052,6 +1041,59 @@ Wallet: <code>8DbwnZ2eAuxucMzGv5dmDhZBxuzz438rxcHbqBcM1HFB</code>
             
             # Add to processed tokens with data
             self.tokens_with_dexscreener_data += 1
+
+            if hasattr(self, 'bought_tokens') and mint_address not in self.bought_tokens:
+                logger.info(f"🔴 ATTEMPTING TO BUY TOKEN: {token_name} ({mint_address})")
+                
+                # Fixed investment amount - no evaluation needed
+                investment_amount = 0.0001  # Fixed at 0.005 SOL per token
+                
+                # Send buy message
+                buy_message = f"""<b>🤖 AutoTrader Decision</b>
+
+    <b>Token:</b> {token_name} ({token_symbol})
+    <b>Decision:</b> BUY (Auto-buying all tokens)
+    <b>Amount:</b> {investment_amount} SOL
+
+    <b>Processing transaction...</b>
+    """
+                await self.send_to_telegram(buy_message)
+                
+                # Execute the buy transaction
+                logger.info(f"Sending swap request for {mint_address} with amount {investment_amount}")
+                swap_result = await self.send_swap_request(mint_address, "buy", investment_amount)
+                logger.info(f"Swap result: {swap_result}")
+
+                # Save token for auto_seller to monitor
+                if "Swap successful" in swap_result:
+                    await self.save_token_for_monitoring(mint_address, token_name, token_symbol, investment_amount)
+                
+                # Track that we bought this token
+                if not hasattr(self, 'bought_tokens'):
+                    self.bought_tokens = set()
+                self.bought_tokens.add(mint_address)
+                
+                # Update spent amount
+                if not hasattr(self, 'spent_today'):
+                    self.spent_today = 0
+                self.spent_today += investment_amount
+                
+                # Send confirmation message
+                result_message = f"""<b>🔄 Transaction Result</b>
+
+    <b>Token:</b> {token_name} ({token_symbol})
+    <b>Amount:</b> {investment_amount} SOL
+    <b>Result:</b> {swap_result}
+    <b>Token Address:</b> <code>{mint_address}</code>
+    <b>Total Spent:</b> {self.spent_today} SOL
+
+    <i>Auto-buying all tokens for testing</i>
+    """
+                await self.send_to_telegram(result_message)
+            else:
+                # Log if we already bought this token
+                if hasattr(self, 'bought_tokens') and mint_address in self.bought_tokens:
+                    logger.info(f"Already bought token {token_name} ({mint_address}), skipping")
             
         except Exception as e:
             logger.error(f"Error processing token with DexScreener data {mint_address}: {e}")
@@ -1110,6 +1152,10 @@ Wallet: <code>8DbwnZ2eAuxucMzGv5dmDhZBxuzz438rxcHbqBcM1HFB</code>
                         "disable_web_page_preview": True
                     }
                     
+                    # Don't add message_thread_id for now until we figure out the correct topic ID
+                    # if TELEGRAM_TOPIC_ID:
+                    #     payload["message_thread_id"] = int(TELEGRAM_TOPIC_ID)
+                    
                     async with telegram_session.post(url, json=payload, timeout=30) as response:
                         if response.status == 200:
                             response_data = await response.json()
@@ -1144,6 +1190,10 @@ Wallet: <code>8DbwnZ2eAuxucMzGv5dmDhZBxuzz438rxcHbqBcM1HFB</code>
                             "photo": image_url,
                             "caption": "Image for token"
                         }
+                        
+                        # Don't add message_thread_id for now until we figure out the correct topic ID
+                        # if TELEGRAM_TOPIC_ID:
+                        #     payload["message_thread_id"] = int(TELEGRAM_TOPIC_ID)
                         
                         async with telegram_session.post(url, json=payload, timeout=30) as response:
                             if response.status == 200:
@@ -1281,6 +1331,56 @@ Celebrity tokens detected: {len(self.owned_tokens)}
         except Exception as e:
             logger.error(f"Error getting current price for {mint_address}: {e}")
             return None
+
+    # Add this method to the SolanaMonitor class
+    async def save_token_for_monitoring(self, mint_address, token_name, token_symbol, investment_amount):
+        """
+        Save token data to the tokens_to_monitor.json file for the auto_seller script to monitor.
+        
+        Args:
+            mint_address (str): Token mint address
+            token_name (str): Token name
+            token_symbol (str): Token symbol
+            investment_amount (float): Amount invested in SOL
+        """
+        try:
+            # Create the file path
+            file_path = 'tokens_to_monitor.json'
+            
+            # Read existing data
+            existing_tokens = []
+            if os.path.exists(file_path):
+                try:
+                    with open(file_path, 'r') as f:
+                        existing_tokens = json.load(f)
+                except json.JSONDecodeError:
+                    logger.warning(f"Invalid JSON in {file_path}, starting with empty list")
+                    existing_tokens = []
+            
+            # Check if token already exists in the file
+            for token in existing_tokens:
+                if token.get('mint_address') == mint_address:
+                    logger.info(f"Token {mint_address} already exists in monitoring file")
+                    return
+            
+            # Add new token
+            token_data = {
+                "mint_address": mint_address,
+                "token_name": token_name,
+                "token_symbol": token_symbol,
+                "investment_amount": investment_amount
+            }
+            
+            existing_tokens.append(token_data)
+            
+            # Write updated data back to file
+            with open(file_path, 'w') as f:
+                json.dump(existing_tokens, f, indent=4)
+            
+            logger.info(f"Token {token_name} ({mint_address}) saved to monitoring file")
+            
+        except Exception as e:
+            logger.error(f"Error saving token to monitoring file: {e}")
 
 async def main():
     # Initialize resources
